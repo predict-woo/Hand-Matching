@@ -20,6 +20,7 @@ def pcd2dense(
     faces: np.ndarray,
     vert_count: int,
     mesh_base_color=(1.0, 1.0, 0.9),
+    viewable_indices=None,
 ) -> o3d.geometry.PointCloud:
     faces_left = faces[:, [0, 2, 1]]
     faces_right = faces
@@ -30,8 +31,25 @@ def pcd2dense(
 
     mesh = o3d.geometry.TriangleMesh()
     mesh.vertices = o3d.utility.Vector3dVector(pcd.points)
-    mesh.triangles = o3d.utility.Vector3iVector(both_hands_faces)
     mesh.vertex_colors = o3d.utility.Vector3dVector(vertex_colors)
+
+    if viewable_indices is not None:
+        # Filter faces to only include those where all vertices are viewable
+        viewable_indices_set = set(viewable_indices)
+        filtered_faces = []
+        for face in both_hands_faces:
+            if all(vertex in viewable_indices_set for vertex in face):
+                filtered_faces.append(face)
+        mesh.triangles = o3d.utility.Vector3iVector(np.array(filtered_faces))
+    else:
+        mesh.triangles = o3d.utility.Vector3iVector(both_hands_faces)
+
+    # save mesh
+    o3d.io.write_triangle_mesh(
+        f"viewable_mesh.ply",
+        mesh,
+        write_triangle_uvs=True,
+    )
 
     res_pcd: o3d.geometry.PointCloud = mesh.sample_points_uniformly(
         number_of_points=vert_count

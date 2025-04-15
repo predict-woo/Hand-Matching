@@ -49,13 +49,17 @@ def compute_alignment_loss(
     focal_length,
     ego_focal_length_opt_args: FocalLengthOptArgs,
     exo_focal_length_opt_args: FocalLengthOptArgs,
+    weights=None,
     return_details=False,
 ):
     ego_focal_length_opt_args["focal_length"] = focal_length
     exo_focal_length_opt_args["focal_length"] = focal_length
     ego_pcd = transform_verts_focal_length(ego_focal_length_opt_args)
     exo_pcd = transform_verts_focal_length(exo_focal_length_opt_args)
-    transformation, loss, _ = umeyama_alignment(ego_pcd, exo_pcd)
+    if weights is not None:
+        transformation, loss, _ = weighted_umeyama_alignment(ego_pcd, exo_pcd, weights)
+    else:
+        transformation, loss, _ = umeyama_alignment(ego_pcd, exo_pcd)
     if return_details:
         return loss, transformation, ego_pcd, exo_pcd
     return loss
@@ -64,11 +68,12 @@ def compute_alignment_loss(
 def optimize_focal_length(
     ego_focal_length_opt_args: FocalLengthOptArgs,
     exo_focal_length_opt_args: FocalLengthOptArgs,
+    weights=None,
 ):
     result = minimize_scalar(
         compute_alignment_loss,
         bounds=(1, 5000),
-        args=(ego_focal_length_opt_args, exo_focal_length_opt_args),
+        args=(ego_focal_length_opt_args, exo_focal_length_opt_args, weights),
         method="bounded",
     )
 
@@ -76,6 +81,7 @@ def optimize_focal_length(
         result.x,
         ego_focal_length_opt_args,
         exo_focal_length_opt_args,
+        weights=weights,
         return_details=True,
     )
 

@@ -20,6 +20,7 @@ from utils.alignment import (
     optimize_focal_length,
     FocalLengthOptArgs,
     register_point_clouds,
+    compute_alignment_loss,
 )
 from utils.data import load_from_rgb_path
 from utils.manipulation import depth2pcd, pcd2dense
@@ -28,6 +29,8 @@ import open3d as o3d
 import copy
 import numpy as np
 from typing import Any
+
+USE_WEIGHTED = False
 
 
 def main():
@@ -59,7 +62,8 @@ def main():
     images = [ego_image, exo_image]
     params = []
     masks = []
-
+    verts = []
+    viewable_indices = []
     for image in images:
         boxes, right = vit_pose_detection(image, detector, cpm)
         dataset = ViTDetDataset(
@@ -83,6 +87,10 @@ def main():
         img_size = batch["img_size"].float()
         ret_verts = out["pred_vertices"]
         ret_verts[:, :, 0] = multiplier.reshape(-1, 1) * ret_verts[:, :, 0]
+
+        keypoints = out["pred_keypoints_3d"]
+        keypoints[:, :, 0] = multiplier.reshape(-1, 1) * keypoints[:, :, 0]
+
         is_right = batch["right"]
 
         scaled_focal_length = (
@@ -104,12 +112,13 @@ def main():
         all_cam_t = [pred_cam_t_full[n] for n in range(2)]
         all_right = [is_right[n].cpu().numpy() for n in range(2)]
 
-        mask = renderer.render_mask_multiple(
+        mask, viewable_index = renderer.render_mask_multiple(
             all_verts,
             cam_t=all_cam_t,
             render_res=img_size[0],
             is_right=all_right,
             focal_length=scaled_focal_length,
+            viewable_threshold=0.008,
         )
 
         image_processed_result: FocalLengthOptArgs = {
@@ -118,21 +127,45 @@ def main():
             "box_size": box_size,
             "img_size": img_size,
             "focal_length": scaled_focal_length,
-            "ret_verts": ret_verts,
+            "ret_verts": ret_verts if not USE_WEIGHTED else keypoints,
             "is_right": is_right,
         }
 
         params.append(image_processed_result)
         masks.append(mask)
+        verts.append(ret_verts)
+        viewable_indices.append(viewable_index)
 
     ego_mask = masks[0]
     exo_mask = masks[1]
 
+    ego_verts = verts[0]
+    exo_verts = verts[1]
+
+    ego_viewable_indices = viewable_indices[0]
+    exo_viewable_indices = viewable_indices[1]
+
     ego_params: FocalLengthOptArgs = params[0]
     exo_params: FocalLengthOptArgs = params[1]
 
+    weights = None
+    if USE_WEIGHTED:
+        hand_level_index = [
+            [2, 5, 9, 13, 17],
+            [3, 6, 10, 14, 18, 0],
+            [4, 7, 11, 15, 19, 1],
+            [8, 12, 16, 20],
+        ]
+
+        weights = np.ones((21,))
+        decay = 0.75
+        for index in range(len(hand_level_index)):
+            weights[hand_level_index[index]] = decay**index
+
+        weights = np.repeat(weights, 2)
+
     opt_focal_length, loss, alignment_transform, ego_mano_pcd, exo_mano_pcd = (
-        optimize_focal_length(ego_params, exo_params)
+        optimize_focal_length(ego_params, exo_params, weights)
     )
 
     o3d.io.write_point_cloud(
@@ -142,16 +175,41 @@ def main():
         .paint_uniform_color([1, 0, 0])
         + copy.deepcopy(exo_mano_pcd).paint_uniform_color([0, 0, 1]),
     )
+
     print(f"Optimized focal length: {opt_focal_length}")
     print(f"Loss: {loss}")
     print(f"Alignment transform: {alignment_transform}")
+
+    if USE_WEIGHTED:
+        ego_params["ret_verts"] = ego_verts
+        exo_params["ret_verts"] = exo_verts
+        _, _, ego_mano_pcd, exo_mano_pcd = compute_alignment_loss(
+            opt_focal_length, ego_params, exo_params, return_details=True
+        )
+        o3d.io.write_point_cloud(
+            f"{args.out_folder}/weighted_focal_length_test.ply",
+            copy.deepcopy(ego_mano_pcd)
+            .transform(alignment_transform)
+            .paint_uniform_color([1, 0, 0])
+            + copy.deepcopy(exo_mano_pcd).paint_uniform_color([0, 0, 1]),
+        )
 
     ego_depth, ego_rgb, ego_cam_int, ego_cam_ext = load_from_rgb_path(args.ego_image)
     exo_depth, exo_rgb, exo_cam_int, exo_cam_ext = load_from_rgb_path(args.exo_image)
     ego_pcd = depth2pcd(ego_depth, ego_rgb, ego_cam_int, ego_cam_ext, mask=ego_mask)
     exo_pcd = depth2pcd(exo_depth, exo_rgb, exo_cam_int, exo_cam_ext, mask=exo_mask)
-    ego_mano_pcd = pcd2dense(ego_mano_pcd, hamer_model.mano.faces, len(ego_pcd.points))
-    exo_mano_pcd = pcd2dense(exo_mano_pcd, hamer_model.mano.faces, len(exo_pcd.points))
+    ego_mano_pcd = pcd2dense(
+        ego_mano_pcd,
+        hamer_model.mano.faces,
+        len(ego_pcd.points),
+        viewable_indices=ego_viewable_indices,
+    )
+    exo_mano_pcd = pcd2dense(
+        exo_mano_pcd,
+        hamer_model.mano.faces,
+        len(exo_pcd.points),
+        viewable_indices=exo_viewable_indices,
+    )
 
     aligned_ego_mano_pcd, ego_transformation = register_point_clouds(
         source_pcd=ego_mano_pcd, target_pcd=ego_pcd
