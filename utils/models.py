@@ -1,11 +1,6 @@
 # Local imports
 from hamer.configs import CACHE_DIR_HAMER
-from hamer.models import HAMER, download_models, load_hamer, DEFAULT_CHECKPOINT
 from hamer.utils import recursive_to
-from hamer.datasets.vitdet_dataset import ViTDetDataset
-from hamer.utils.renderer import Renderer, cam_crop_to_full
-from utils.vitpose_model import ViTPoseModel
-from hamer.utils.utils_detectron2 import DefaultPredictor_Lazy
 import torch
 from pathlib import Path
 import numpy as np
@@ -13,6 +8,14 @@ from torch.utils.data.dataloader import default_collate
 import cv2
 import os
 from typing import Any
+from vggt.models.vggt import VGGT
+import open3d as o3d
+from hamer.utils.renderer import cam_crop_to_full
+from hamer.datasets.vitdet_dataset import ViTDetDataset
+from PIL import Image
+from vggt.utils.load_fn import load_and_preprocess_images
+from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+from vggt.utils.geometry import unproject_depth_map_to_point_map
 
 LIGHT_BLUE = (0.65098039, 0.74117647, 0.85882353)
 DEFAULT_FOCAL_LENGTH_BOUNDS = (1, 5000)
@@ -36,6 +39,8 @@ def initialize_hamer(checkpoint, device="cuda"):
     Returns:
         tuple: (model, model_cfg, device, detector, cpm, renderer)
     """
+    from hamer.models import download_models, load_hamer
+
     print(f"Initializing HAMER from {checkpoint}")
     download_models(CACHE_DIR_HAMER)
     model, model_cfg = load_hamer(checkpoint)
@@ -57,6 +62,8 @@ def initialize_detector(body_detector="regnety"):
     Returns:
         detector: The body detector.
     """
+    from hamer.utils.utils_detectron2 import DefaultPredictor_Lazy
+
     print(f"Initializing body detector: {body_detector}")
     if body_detector == "vitdet":
         from detectron2.config import LazyConfig
@@ -74,7 +81,6 @@ def initialize_detector(body_detector="regnety"):
         detector = DefaultPredictor_Lazy(detectron2_cfg)
     elif body_detector == "regnety":
         from detectron2 import model_zoo
-        from detectron2.config import get_cfg
 
         detectron2_cfg = model_zoo.get_config(
             "new_baselines/mask_rcnn_regnety_4gf_dds_FPN_400ep_LSJ.py", trained=True
@@ -100,6 +106,8 @@ def initialize_vitpose(device="cuda"):
     Returns:
         cpm: The ViTPose model.
     """
+    from utils.vitpose_model import ViTPoseModel
+
     print(f"Initializing ViTPose model")
     cpm = ViTPoseModel(device)
     torch.cuda.empty_cache()
@@ -201,6 +209,7 @@ def process_image(
     Returns:
         tuple: Hand vertices, camera parameters, and other detection data
     """
+
     boxes, right = vit_pose_detection(img_cv2, detector, cpm)
     dataset = ViTDetDataset(model_cfg, img_cv2, boxes, right, rescale_factor=2.0)
 
@@ -281,3 +290,87 @@ def process_image(
     cv2.imwrite(os.path.join(out_folder, f"{out_name}_all_mask.png"), 255 * mask)
 
     return ret_verts, pred_cam, box_center, box_size, img_size, is_right, mask
+
+
+def initialize_vggt(device="cuda"):
+    """
+    Initialize the VGG-T model.
+    """
+
+    model = VGGT()
+    print(f"Loading model to {device}...")
+    model.load_state_dict(
+        torch.hub.load_state_dict_from_url(
+            "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt",
+            map_location=device,
+        )
+    )
+    model.eval()
+    model = model.to(device)
+    print_GPU_memory()
+    return model
+
+
+def vggt_create_point_cloud(
+    image_path: str,
+    model: VGGT,
+    mask=None,
+    device="cuda",
+):
+
+    image_names = [image_path]
+    images_tensor = load_and_preprocess_images(image_names).to(device)
+
+    H, W = images_tensor.shape[2:]
+
+    original_image_pil = Image.open(image_path).convert("RGB")
+    resized_image_pil = original_image_pil.resize((W, H), Image.Resampling.LANCZOS)
+    resized_image_np = np.array(resized_image_pil)
+    colors = resized_image_np / 255.0
+
+    with torch.no_grad():
+        predictions = model(images_tensor)
+
+    extrinsic, intrinsic = pose_encoding_to_extri_intri(predictions["pose_enc"], (H, W))
+
+    # Check if values are None before processing
+    if extrinsic is None or intrinsic is None:
+        print(
+            "Error: Failed to extract camera parameters. extrinsic or intrinsic is None."
+        )
+        print(f"predictions[pose_enc] shape: {predictions['pose_enc'].shape}")
+        return
+
+    depth_map_np = predictions["depth"].cpu().numpy().squeeze(0).squeeze(0)
+    extrinsic_np = extrinsic.cpu().numpy().squeeze(0).squeeze(0)
+    intrinsic_np = intrinsic.cpu().numpy().squeeze(0).squeeze(0)
+
+    depth_map_np_unsqueezed = np.expand_dims(depth_map_np, axis=0)  # (1, H, W, 1)
+    extrinsic_np_unsqueezed = np.expand_dims(extrinsic_np, axis=0)  # (1, 4, 3)
+    intrinsic_np_unsqueezed = np.expand_dims(intrinsic_np, axis=0)  # (1, 3, 3)
+
+    world_points_np = unproject_depth_map_to_point_map(
+        depth_map_np_unsqueezed, extrinsic_np_unsqueezed, intrinsic_np_unsqueezed
+    )
+    world_points_np = world_points_np.squeeze(0)
+
+    if mask is not None:
+        mask_pil = Image.fromarray(mask)
+        mask_pil = mask_pil.resize((W, H), Image.Resampling.NEAREST)
+        mask_np = np.array(mask_pil)
+        mask_np = mask_np > 0
+
+        world_points_masked = world_points_np[~mask_np]
+        colors_masked = colors[~mask_np]
+    else:
+        world_points_masked = world_points_np.reshape(-1, 3)
+        colors_masked = colors.reshape(-1, 3)
+
+    points = world_points_masked
+    colors = colors_masked
+
+    pcd: o3d.geometry.PointCloud = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points)
+    pcd.colors = o3d.utility.Vector3dVector(colors)
+
+    return pcd

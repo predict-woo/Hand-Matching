@@ -11,7 +11,10 @@ from utils.models import (
     initialize_hamer,
     initialize_detector,
     initialize_vitpose,
+    initialize_vggt,
     vit_pose_detection,
+    vggt_create_point_cloud,
+    print_GPU_memory,
 )
 from hamer.utils import recursive_to
 
@@ -21,35 +24,49 @@ from utils.alignment import (
     FocalLengthOptArgs,
     register_point_clouds,
     compute_alignment_loss,
+    register_point_clouds_with_scale_ambiguity,
 )
 from utils.data import load_from_rgb_path
 from utils.manipulation import depth2pcd, pcd2dense
-
 import open3d as o3d
 import copy
 import numpy as np
 from typing import Any
+import os
+from utils.manipulation import exo2ego_force
 
-USE_WEIGHTED = False
+USE_WEIGHTED = True
+USE_PSUEDO_DEPTH = True
 
 
-def main():
-    args = argparse.ArgumentParser()
-    args.add_argument("--hamer_checkpoint", default=DEFAULT_CHECKPOINT, type=str)
-    args.add_argument("--body_detector", default="regnety", type=str)
-    args.add_argument("--device", default="cuda", type=str)
-    args.add_argument("--out_folder", default="output", type=str)
-    args.add_argument(
-        "--ego_image",
-        default="/local/home/andrye/dev/H2O/subject1/h1/2/cam4/rgb/000043.png",
-        type=str,
-    )
-    args.add_argument(
-        "--exo_image",
-        default="/local/home/andrye/dev/H2O/subject1/h1/2/cam2/rgb/000043.png",
-        type=str,
-    )
-    args = args.parse_args()
+def main(args_in=None):
+    if args_in is None:
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--hamer_checkpoint", default=DEFAULT_CHECKPOINT, type=str)
+        parser.add_argument("--body_detector", default="regnety", type=str)
+        parser.add_argument("--device", default="cuda", type=str)
+        parser.add_argument("--out_folder", default="output", type=str)
+        parser.add_argument(
+            "--ego_image",
+            default="/local/home/andrye/dev/H2O/subject1/h1/2/cam4/rgb/000043.png",
+            type=str,
+        )
+        parser.add_argument(
+            "--exo_image",
+            default="/local/home/andrye/dev/H2O/subject1/h1/2/cam2/rgb/000043.png",
+            type=str,
+        )
+        args = parser.parse_args()
+    else:
+        args = args_in
+        if not hasattr(args, "hamer_checkpoint"):
+            args.hamer_checkpoint = DEFAULT_CHECKPOINT
+        if not hasattr(args, "body_detector"):
+            args.body_detector = "regnety"
+        if not hasattr(args, "device"):
+            args.device = "cuda"
+        if not hasattr(args, "out_folder"):
+            args.out_folder = "output"
 
     hamer_model, hamer_model_cfg = initialize_hamer(args.hamer_checkpoint, args.device)
     detector = initialize_detector(args.body_detector)
@@ -64,6 +81,7 @@ def main():
     masks = []
     verts = []
     viewable_indices = []
+
     for image in images:
         boxes, right = vit_pose_detection(image, detector, cpm)
         dataset = ViTDetDataset(
@@ -121,6 +139,8 @@ def main():
             viewable_threshold=0.008,
         )
 
+        np.save(f"mask.npy", mask)
+
         image_processed_result: FocalLengthOptArgs = {
             "cam_bbox": pred_cam,
             "box_center": box_center,
@@ -135,6 +155,12 @@ def main():
         masks.append(mask)
         verts.append(ret_verts)
         viewable_indices.append(viewable_index)
+
+    # release all gpu memory
+    torch.cuda.empty_cache()
+    mano_faces = hamer_model.mano.faces
+    del hamer_model, hamer_model_cfg, detector, cpm, renderer
+    print_GPU_memory()
 
     ego_mask = masks[0]
     exo_mask = masks[1]
@@ -196,38 +222,63 @@ def main():
 
     ego_depth, ego_rgb, ego_cam_int, ego_cam_ext = load_from_rgb_path(args.ego_image)
     exo_depth, exo_rgb, exo_cam_int, exo_cam_ext = load_from_rgb_path(args.exo_image)
-    ego_pcd = depth2pcd(ego_depth, ego_rgb, ego_cam_int, ego_cam_ext, mask=ego_mask)
-    exo_pcd = depth2pcd(exo_depth, exo_rgb, exo_cam_int, exo_cam_ext, mask=exo_mask)
+
+    if USE_PSUEDO_DEPTH:
+        vggt_model = initialize_vggt()
+
+        ego_pcd: o3d.geometry.PointCloud = vggt_create_point_cloud(
+            args.ego_image, vggt_model, mask=ego_mask
+        )
+        exo_pcd: o3d.geometry.PointCloud = vggt_create_point_cloud(
+            args.exo_image, vggt_model, mask=exo_mask
+        )
+    else:
+        ego_pcd = depth2pcd(ego_depth, ego_rgb, ego_cam_int, ego_cam_ext, mask=ego_mask)
+        exo_pcd = depth2pcd(exo_depth, exo_rgb, exo_cam_int, exo_cam_ext, mask=exo_mask)
+
     ego_mano_pcd = pcd2dense(
         ego_mano_pcd,
-        hamer_model.mano.faces,
+        mano_faces,
         len(ego_pcd.points),
         viewable_indices=ego_viewable_indices,
     )
     exo_mano_pcd = pcd2dense(
         exo_mano_pcd,
-        hamer_model.mano.faces,
+        mano_faces,
         len(exo_pcd.points),
         viewable_indices=exo_viewable_indices,
     )
 
-    aligned_ego_mano_pcd, ego_transformation = register_point_clouds(
-        source_pcd=ego_mano_pcd, target_pcd=ego_pcd
-    )
+    if USE_PSUEDO_DEPTH:
+        aligned_ego_mano_pcd, ego_transformation, ego_final_scale = (
+            register_point_clouds_with_scale_ambiguity(
+                source_pcd=ego_mano_pcd, target_pcd=ego_pcd
+            )
+        )
+        print(f"Ego Final scale: {ego_final_scale}")
+        aligned_exo_mano_pcd, exo_transformation, exo_final_scale = (
+            register_point_clouds_with_scale_ambiguity(
+                source_pcd=exo_mano_pcd, target_pcd=exo_pcd
+            )
+        )
+        print(f"Exo Final scale: {exo_final_scale}")
+    else:
+        aligned_ego_mano_pcd, ego_transformation = register_point_clouds(
+            source_pcd=ego_mano_pcd, target_pcd=ego_pcd
+        )
+        aligned_exo_mano_pcd, exo_transformation = register_point_clouds(
+            source_pcd=exo_mano_pcd, target_pcd=exo_pcd
+        )
+
     ## test
     o3d.io.write_point_cloud(
-        f"{args.out_folder}/ego_registration_test.ply",
+        f"{args.out_folder}/{os.path.basename(args.ego_image).replace('.png', '')}_ego_registration_test.ply",
         copy.deepcopy(ego_mano_pcd).transform(ego_transformation)
         + copy.deepcopy(ego_pcd),
     )
 
-    # Register exo point cloud
-    aligned_exo_mano_pcd, exo_transformation = register_point_clouds(
-        source_pcd=exo_mano_pcd, target_pcd=exo_pcd
-    )
-    ## test
     o3d.io.write_point_cloud(
-        f"{args.out_folder}/exo_registration_test.ply",
+        f"{args.out_folder}/{os.path.basename(args.ego_image).replace('.png', '')}_exo_registration_test.ply",
         copy.deepcopy(exo_mano_pcd).transform(exo_transformation)
         + copy.deepcopy(exo_pcd),
     )
@@ -238,15 +289,93 @@ def main():
     )
     exo_to_ego_transform = np.linalg.inv(ego_to_exo_transform)
 
-    ego_total_pcd = depth2pcd(ego_depth, ego_rgb, ego_cam_int, ego_cam_ext)
-    exo_total_pcd = depth2pcd(exo_depth, exo_rgb, exo_cam_int, exo_cam_ext)
+    if USE_PSUEDO_DEPTH:
+        ego_total_pcd = vggt_create_point_cloud(args.ego_image, vggt_model)
+        exo_total_pcd = vggt_create_point_cloud(args.exo_image, vggt_model)
+    else:
+        ego_total_pcd = depth2pcd(ego_depth, ego_rgb, ego_cam_int, ego_cam_ext)
+        exo_total_pcd = depth2pcd(exo_depth, exo_rgb, exo_cam_int, exo_cam_ext)
+    o3d.io.write_point_cloud(
+        f"{args.out_folder}/{os.path.basename(args.ego_image).replace('.png', '')}_ego_total_pcd.ply",
+        ego_total_pcd,
+    )
+    o3d.io.write_point_cloud(
+        f"{args.out_folder}/{os.path.basename(args.ego_image).replace('.png', '')}_exo_total_pcd.ply",
+        exo_total_pcd,
+    )
 
     transformed_ego_total_pcd = copy.deepcopy(ego_total_pcd)
     transformed_ego_total_pcd.transform(ego_to_exo_transform)
     combined_total_pcd = transformed_ego_total_pcd + exo_total_pcd
-    o3d.io.write_point_cloud(f"{args.out_folder}/combined_pcd.ply", combined_total_pcd)
-    print(f"Saved combined point cloud to {args.out_folder}/combined_pcd.ply")
+    o3d.io.write_point_cloud(
+        f"{args.out_folder}/{os.path.basename(args.ego_image).replace('.png', '')}_combined_pcd.ply",
+        combined_total_pcd,
+    )
+    print(
+        f"Saved combined point cloud to {args.out_folder}/{os.path.basename(args.ego_image).replace('.png', '')}_combined_pcd.ply"
+    )
+
+    ##################################
+
+    # exo_rgb_path = args.exo_image
+    # exo_cam_id = "cam2"
+    # ego_cam_id = "cam4"
+
+    # exo_rgb_path = exo_rgb_path.replace(exo_cam_id, exo_cam_id)
+    # exo_depth_path = exo_rgb_path.replace("rgb", "depth")
+    # exo_rgb_id = os.path.join("rgb", exo_rgb_path.split("/")[-1])
+    # exo_cam_int_path = exo_rgb_path.replace(exo_rgb_id, "cam_intrinsics.txt")
+    # exo_cam_ext_path = exo_rgb_path.replace("rgb", "cam_pose").replace("png", "txt")
+    # exo_hand_path = exo_rgb_path.replace("rgb", "hand_pose").replace("png", "txt")
+    # # egos
+    # ego_cam_int_path = exo_cam_int_path.replace(exo_cam_id, ego_cam_id)
+    # ego_cam_ext_path = exo_cam_ext_path.replace(exo_cam_id, ego_cam_id)
+    # ego_hand_path = exo_hand_path.replace(exo_cam_id, ego_cam_id)
+    # ego_rgb_pred = exo2ego_force(
+    #     exo_rgb_path,
+    #     exo_depth_path,
+    #     exo_cam_int_path,
+    #     exo_cam_ext_path,
+    #     exo_hand_path,
+    #     ego_cam_int_path,
+    #     ego_cam_ext_path,
+    #     ego_hand_path,
+    #     np.linalg.inv(ego_to_exo_transform),
+    # )
+    # cv2.imwrite(
+    #     f"{args.out_folder}/{os.path.basename(args.exo_image)}.png", ego_rgb_pred
+    # )
 
 
 if __name__ == "__main__":
-    main()
+    import glob
+    import random
+
+    # list image paths under /local/home/andrye/dev/H2O/subject1/h1/2/cam4/rgb/
+    ego_image_paths = glob.glob(
+        "/local/home/andrye/dev/H2O/subject1/h1/2/cam4/rgb/*.png"
+    )
+
+    # randomly mix
+    random.shuffle(ego_image_paths)
+
+    # cut 10 paths
+    ego_image_paths = ego_image_paths[:10]
+
+    # create exo by replacing with cam2
+    exo_image_paths = [path.replace("cam4", "cam2") for path in ego_image_paths]
+
+    for ego_image_path, exo_image_path in zip(ego_image_paths, exo_image_paths):
+        try:
+            print(f"Running main for image {ego_image_path}")
+            loop_args = argparse.Namespace(
+                ego_image=ego_image_path,
+                exo_image=exo_image_path,
+                hamer_checkpoint=DEFAULT_CHECKPOINT,
+                body_detector="regnety",
+                device="cuda",
+                out_folder="output",
+            )
+            main(loop_args)
+        except Exception as e:
+            print(f"Error running main for image {ego_image_path}: {e}")

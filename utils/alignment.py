@@ -377,3 +377,167 @@ def register_point_clouds(
 
     print("Registration complete.")
     return source_pcd, final_transformation
+
+
+def register_point_clouds_with_scale_ambiguity(
+    source_pcd, target_pcd, voxel_size=0.005, default_color=[0, 0.651, 0.929]
+):
+
+    print(f"\nStarting registration with variance matching, voxel size: {voxel_size}")
+
+    # Make copies to avoid modifying the originals
+    source_pcd_orig = copy.deepcopy(source_pcd)  # save original for final application
+    source_pcd = copy.deepcopy(source_pcd)
+    target_pcd = copy.deepcopy(target_pcd)
+
+    # --- Step 1: Variance Matching ---
+    print("Matching variance between point clouds...")
+    source_points = np.asarray(source_pcd.points)
+    target_points = np.asarray(target_pcd.points)
+
+    # Compute centroid and standard deviation for both point clouds
+    source_mean = np.mean(source_points, axis=0)
+    target_mean = np.mean(target_points, axis=0)
+    source_std = np.std(source_points, axis=0)
+    target_std = np.std(target_points, axis=0)
+
+    # Use the average standard deviation (across dimensions) as a measure of variance
+    avg_source_std = np.mean(source_std)
+    avg_target_std = np.mean(target_std)
+    variance_scale = avg_target_std / avg_source_std
+    print(f"Computed variance scaling factor: {variance_scale:.4f}")
+
+    # Create transformation: scaling around the source centroid.
+    variance_transform = np.eye(4)
+    variance_transform[0, 0] = variance_scale
+    variance_transform[1, 1] = variance_scale
+    variance_transform[2, 2] = variance_scale
+    # When scaling about the source centroid, a translation is induced:
+    variance_transform[:3, 3] = source_mean * (1 - variance_scale)
+
+    # Apply the variance matching transform to the source cloud
+    source_pcd.scale(variance_scale, center=source_mean)
+    print("Variance matching applied to the source point cloud.")
+
+    # --- Step 2: Initial Mean Alignment ---
+    print("Performing initial mean (centroid) alignment...")
+    # After variance matching, recalc source centroid
+    source_points = np.asarray(source_pcd.points)
+    source_mean = np.mean(source_points, axis=0)
+    target_mean = np.mean(target_points, axis=0)
+    translation_vector = target_mean - source_mean
+
+    mean_alignment_transform = np.eye(4)
+    mean_alignment_transform[:3, 3] = translation_vector
+    source_pcd.translate(translation_vector)
+    print(f"Applied mean alignment translation: {translation_vector}")
+
+    # --- Color Check (for visualization/feature estimation) ---
+    if not source_pcd.has_colors():
+        source_pcd.paint_uniform_color(default_color)
+    if not target_pcd.has_colors():
+        target_pcd.paint_uniform_color(default_color)
+
+    # --- Step 3: Global Registration (RANSAC with Scaling) ---
+    print("Downsampling point clouds for global registration...")
+    source_down = source_pcd.voxel_down_sample(voxel_size)
+    target_down = target_pcd.voxel_down_sample(voxel_size)
+
+    radius_normal = voxel_size * 2
+    print("Estimating normals for the downsampled clouds...")
+    source_down.estimate_normals(
+        o3d.geometry.KDTreeSearchParamHybrid(radius=radius_normal, max_nn=30)
+    )
+    target_down.estimate_normals(
+        o3d.geometry.KDTreeSearchParamHybrid(radius=radius_normal, max_nn=30)
+    )
+
+    radius_feature = voxel_size * 5
+    print("Computing FPFH features...")
+    source_fpfh = o3d.pipelines.registration.compute_fpfh_feature(
+        source_down,
+        o3d.geometry.KDTreeSearchParamHybrid(radius=radius_feature, max_nn=100),
+    )
+    target_fpfh = o3d.pipelines.registration.compute_fpfh_feature(
+        target_down,
+        o3d.geometry.KDTreeSearchParamHybrid(radius=radius_feature, max_nn=100),
+    )
+
+    distance_threshold_global = voxel_size * 1.5
+    print("Running global registration (RANSAC with scaling)...")
+    result_ransac = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
+        source_down,
+        target_down,
+        source_fpfh,
+        target_fpfh,
+        True,  # Use absolute distance
+        distance_threshold_global,
+        o3d.pipelines.registration.TransformationEstimationPointToPoint(
+            # with_scaling=True
+        ),
+        3,  # Minimum number of correspondences
+        [
+            o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(0.9),
+            o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(
+                distance_threshold_global
+            ),
+        ],
+        o3d.pipelines.registration.RANSACConvergenceCriteria(
+            max_iteration=100000, confidence=0.999
+        ),
+    )
+    print("Global registration complete.")
+    print("RANSAC Fitness:", result_ransac.fitness)
+    print("RANSAC Inlier RMSE:", result_ransac.inlier_rmse)
+
+    ransac_transform = result_ransac.transformation
+    init_scale = np.linalg.norm(ransac_transform[:3, 0])
+    print(f"Initial scale estimated from RANSAC: {init_scale:.4f}")
+
+    if result_ransac.fitness < 0.1:
+        print("Warning: Low RANSAC fitness. Subsequent refinement might be affected.")
+
+    # --- Step 4: Fine Registration with ICP (with Scaling) ---
+    print("Estimating normals for fine registration on full-resolution clouds...")
+    source_pcd.estimate_normals(
+        search_param=o3d.geometry.KDTreeSearchParamHybrid(
+            radius=radius_normal, max_nn=30
+        )
+    )
+    target_pcd.estimate_normals(
+        search_param=o3d.geometry.KDTreeSearchParamHybrid(
+            radius=radius_normal, max_nn=30
+        )
+    )
+
+    distance_threshold_icp = voxel_size * 0.4
+    print("Running fine registration (ICP Point-to-Point with scaling)...")
+    result_icp = o3d.pipelines.registration.registration_icp(
+        source_pcd,
+        target_pcd,
+        distance_threshold_icp,
+        ransac_transform,  # Using RANSAC result as initialization
+        o3d.pipelines.registration.TransformationEstimationPointToPoint(
+            with_scaling=True
+        ),
+    )
+    print("ICP complete.")
+    print("ICP Fitness:", result_icp.fitness)
+    print("ICP Inlier RMSE:", result_icp.inlier_rmse)
+    icp_transform = result_icp.transformation
+
+    # --- Combine All Transforms ---
+    # The complete transformation from the original source to target is:
+    # T_final = T_icp * T_mean * T_variance
+    final_transformation = icp_transform @ mean_alignment_transform @ variance_transform
+
+    # Apply the final transformation to the original source cloud
+    transformed_source_pcd = copy.deepcopy(source_pcd_orig)
+    transformed_source_pcd.transform(final_transformation)
+
+    # Extract the final estimated scale from the transformation (first column norm)
+    final_scale = np.linalg.norm(final_transformation[:3, 0])
+    print(f"Final estimated scale (including variance matching): {final_scale:.4f}")
+    print("Registration with variance matching complete.")
+
+    return transformed_source_pcd, final_transformation, final_scale

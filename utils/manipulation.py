@@ -271,6 +271,51 @@ def exo2ego(
     return ego_rgb_pred
 
 
+def exo2ego_force(
+    exo_rgb_path,
+    exo_depth_path,
+    exo_cam_int_path,
+    exo_cam_ext_path,
+    exo_hand_path,
+    ego_cam_int_path,
+    ego_cam_ext_path,
+    ego_hand_path,
+    transformation_chain,
+):
+
+    # get pointcloud from exos
+    exo_cam_int = np.loadtxt(exo_cam_int_path)
+    exo_fx, exo_fy, exo_cx, exo_cy = exo_cam_int[:4]
+    exo_cam_ext = np.loadtxt(exo_cam_ext_path).reshape(4, 4)
+    exo_depth = cv2.imread(exo_depth_path, cv2.IMREAD_ANYDEPTH)
+    points = depth2points(exo_depth, exo_fx, exo_fy, exo_cx, exo_cy).reshape(-1, 3)
+    colors = cv2.imread(exo_rgb_path).reshape(-1, 3)
+
+    # project ego with X
+    ego_cam_ext = np.loadtxt(ego_cam_ext_path).reshape(4, 4)
+    exo_R = exo_cam_ext[:3, :3]
+    ego_R = ego_cam_ext[:3, :3]
+    exo_t = exo_cam_ext[:3, 3:]
+    ego_t = ego_cam_ext[:3, 3:]
+    points /= 1000
+    ego_cam_ext_inv = np.linalg.inv(ego_cam_ext)
+    points_one = np.ones_like(points[:, 0])
+    points_one = np.expand_dims(points_one, axis=1)
+    points = np.hstack([points, points_one])
+
+    # translated_points = ego_cam_ext_inv @ exo_cam_ext @ points.T
+    translated_points = transformation_chain @ points.T
+
+    translated_points = translated_points.T[:, :3]
+    X = np.array([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]])
+    ego_cam_int = np.loadtxt(ego_cam_int_path)
+    ego_fx, ego_fy, ego_cx, ego_cy, ego_w, ego_h = ego_cam_int
+    ego_K = np.array([[ego_fx, 0, ego_cx], [0, ego_fy, ego_cy], [0, 0, 1]])
+    ego_rgb_pred = points2image(translated_points, colors, X, ego_K, ego_w, ego_h)
+
+    return ego_rgb_pred
+
+
 def depth2pcd(depth, rgb, cam_int, cam_ext, mask=None):
     """
     Convert depth map and RGB image to a colored point cloud.
