@@ -189,7 +189,7 @@ def points2image(points, colors, RT, K, image_width, image_height):
 
         if 0 <= x < image_width and 0 <= y < image_height and z > 0:
             color = colors[i].astype(np.uint8).tolist()
-            cv2.circle(rgb_map, (x, y), 0, color, -1)
+            cv2.circle(rgb_map, (x, y), 3, color, -1)
 
     return rgb_map
 
@@ -212,6 +212,62 @@ def depth2points(depth, fx, fy, cx, cy):
     x = (u - cx) * z / fx
     y = (v - cy) * z / fy
     return np.dstack((x, y, z))
+
+
+def exo2ego_force_depth(
+    exo_rgb_path,
+    exo_depth,
+    exo_cam_int_path,
+    exo_cam_ext_path,
+    exo_hand_path,
+    ego_cam_int_path,
+    ego_cam_ext_path,
+    ego_hand_path,
+):
+    """
+    Transform exo-view data to ego-view.
+
+    Args:
+        exo_rgb_path (str): Path to exo RGB image
+        exo_depth_path (str): Path to exo depth map
+        exo_cam_int_path (str): Path to exo camera intrinsics
+        exo_cam_ext_path (str): Path to exo camera extrinsics
+        exo_hand_path (str): Path to exo hand pose
+        ego_cam_int_path (str): Path to ego camera intrinsics
+        ego_cam_ext_path (str): Path to ego camera extrinsics
+        ego_hand_path (str): Path to ego hand pose
+
+    Returns:
+        np.ndarray: Ego RGB prediction
+    """
+    # Load exo data
+    exo_cam_int = np.loadtxt(exo_cam_int_path)
+    exo_fx, exo_fy, exo_cx, exo_cy = exo_cam_int[:4]
+    exo_cam_ext = np.loadtxt(exo_cam_ext_path).reshape(4, 4)
+
+    # Convert depth to points
+    points = depth2points(exo_depth, exo_fx, exo_fy, exo_cx, exo_cy).reshape(-1, 3)
+    colors = cv2.imread(exo_rgb_path).reshape(-1, 3)
+
+    # Load ego camera parameters
+    ego_cam_ext = np.loadtxt(ego_cam_ext_path).reshape(4, 4)
+    ego_cam_ext_inv = np.linalg.inv(ego_cam_ext)
+
+    # Transform points from exo to ego frame
+    # points /= 1000  # Convert mm to meters
+    points_one = np.ones_like(points[:, 0:1])
+    points_h = np.hstack([points, points_one])
+    translated_points = ego_cam_ext_inv @ exo_cam_ext @ points_h.T
+    translated_points = translated_points.T[:, :3]
+
+    # Project points to ego image
+    X = np.eye(4)[:3, :]  # Identity transformation in camera frame
+    ego_cam_int = np.loadtxt(ego_cam_int_path)
+    ego_fx, ego_fy, ego_cx, ego_cy, ego_w, ego_h = ego_cam_int
+    ego_K = np.array([[ego_fx, 0, ego_cx], [0, ego_fy, ego_cy], [0, 0, 1]])
+    ego_rgb_pred = points2image(translated_points, colors, X, ego_K, ego_w, ego_h)
+
+    return ego_rgb_pred
 
 
 def exo2ego(

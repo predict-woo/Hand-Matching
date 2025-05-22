@@ -2,7 +2,8 @@ import copy
 import numpy as np
 import open3d as o3d
 from scipy.optimize import minimize_scalar
-from hamer.utils.renderer import cam_crop_to_full
+
+# from hamer.utils.renderer import cam_crop_to_full
 
 from typing import TypedDict, Any
 import torch
@@ -29,20 +30,20 @@ class FocalLengthOptArgs(TypedDict):
     is_right: torch.Tensor
 
 
-def transform_verts_focal_length(
-    focal_length_opt_args: FocalLengthOptArgs,
-):
-    focal_length_opt_args = copy.deepcopy(focal_length_opt_args)
-    ret_verts = focal_length_opt_args.pop("ret_verts")
-    is_right = focal_length_opt_args.pop("is_right")
-    pred_cam_t = cam_crop_to_full(**focal_length_opt_args).detach().cpu().numpy()
-    verts_t = ret_verts.detach().cpu().numpy() + pred_cam_t[:, None, :]
-    mano_verts = np.concatenate(
-        verts_t if is_right[0] else verts_t[::-1], axis=0
-    )  # make sure right hand comes first
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(mano_verts)
-    return pcd
+# def transform_verts_focal_length(
+#     focal_length_opt_args: FocalLengthOptArgs,
+# ):
+#     focal_length_opt_args = copy.deepcopy(focal_length_opt_args)
+#     ret_verts = focal_length_opt_args.pop("ret_verts")
+#     is_right = focal_length_opt_args.pop("is_right")
+#     pred_cam_t = cam_crop_to_full(**focal_length_opt_args).detach().cpu().numpy()
+#     verts_t = ret_verts.detach().cpu().numpy() + pred_cam_t[:, None, :]
+#     mano_verts = np.concatenate(
+#         verts_t if is_right[0] else verts_t[::-1], axis=0
+#     )  # make sure right hand comes first
+#     pcd = o3d.geometry.PointCloud()
+#     pcd.points = o3d.utility.Vector3dVector(mano_verts)
+#     return pcd
 
 
 def compute_alignment_loss(
@@ -236,6 +237,59 @@ def umeyama_alignment(source_pcd, target_pcd):
     loss = np.mean(np.sum((target - transformed_points) ** 2, axis=1))
 
     return transformation, loss, transformed_source_pcd
+
+
+def umeyama_alignment_pure(source: np.ndarray, target: np.ndarray):
+    """
+    Umeyama algorithm to find optimal transformation between two point clouds.
+
+    Args:
+        source_pcd (o3d.geometry.PointCloud): Source point cloud
+        target_pcd (o3d.geometry.PointCloud): Target point cloud
+
+    Returns:
+        tuple: (transformation, loss, transformed_source_pcd)
+            - transformation (np.ndarray): 4×4 transformation matrix
+            - loss (float): Mean squared error between the aligned source and target points
+            - transformed_source_pcd (o3d.geometry.PointCloud): The transformed source point cloud
+    """
+
+    # Get number of points and dimensions
+    n, d = source.shape
+
+    # Center the points
+    source_centroid = np.mean(source, axis=0)
+    target_centroid = np.mean(target, axis=0)
+    source_centered = source - source_centroid
+    target_centered = target - target_centroid
+
+    # Compute covariance matrix
+    cov = target_centered.T @ source_centered / n
+
+    # SVD of covariance matrix
+    u, s_vals, vh = np.linalg.svd(cov)
+
+    # Handle reflection case
+    reflection_matrix = np.eye(d)
+    if np.linalg.det(u) * np.linalg.det(vh) < 0:
+        reflection_matrix[d - 1, d - 1] = -1
+
+    # Calculate rotation
+    R = u @ reflection_matrix @ vh
+
+    # Calculate scaling
+    var_source = np.sum(np.var(source_centered, axis=0))
+    s = 1.0 if var_source == 0 else np.sum(s_vals) / var_source
+
+    # Calculate translation
+    t = target_centroid - s * R @ source_centroid
+
+    # Create transformation matrix
+    transformation = np.eye(4)
+    transformation[:3, :3] = s * R
+    transformation[:3, 3] = t
+
+    return transformation
 
 
 def register_point_clouds(

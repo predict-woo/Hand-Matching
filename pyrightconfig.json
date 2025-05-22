@@ -1,6 +1,7 @@
 {
   "typeCheckingMode": "basic",
   "extraPaths": [
-    "/local/home/andrye/dev/vggt"
+    "/local/home/andrye/dev/vggt",
+    // "/local/home/andrye/dev/Arbitrary-Hands-3D-Reconstruction"
   ]
 }

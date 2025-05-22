@@ -2,3 +2,10 @@
 output/
 __pycache__/
 .vscode/
+ITW/
+mano
+demos_outputs/
+output/
+leave_out/
+checkpoints/
+*.pth

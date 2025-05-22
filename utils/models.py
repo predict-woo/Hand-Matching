@@ -1,6 +1,6 @@
 # Local imports
-from hamer.configs import CACHE_DIR_HAMER
-from hamer.utils import recursive_to
+
+from hamer.models import DEFAULT_CHECKPOINT
 import torch
 from pathlib import Path
 import numpy as np
@@ -10,8 +10,7 @@ import os
 from typing import Any
 from vggt.models.vggt import VGGT
 import open3d as o3d
-from hamer.utils.renderer import cam_crop_to_full
-from hamer.datasets.vitdet_dataset import ViTDetDataset
+
 from PIL import Image
 from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
@@ -29,7 +28,7 @@ def print_GPU_memory():
     print(f"GPU memory usage: {torch.cuda.memory_allocated() / 1024 ** 2} MB")
 
 
-def initialize_hamer(checkpoint, device="cuda"):
+def initialize_hamer(checkpoint=DEFAULT_CHECKPOINT, device="cuda"):
     """
     Initialize models, detector, and renderer.
 
@@ -40,6 +39,10 @@ def initialize_hamer(checkpoint, device="cuda"):
         tuple: (model, model_cfg, device, detector, cpm, renderer)
     """
     from hamer.models import download_models, load_hamer
+    from hamer.configs import CACHE_DIR_HAMER
+    from hamer.utils import recursive_to
+    from hamer.utils.renderer import cam_crop_to_full
+    from hamer.datasets.vitdet_dataset import ViTDetDataset
 
     print(f"Initializing HAMER from {checkpoint}")
     download_models(CACHE_DIR_HAMER)
@@ -316,6 +319,7 @@ def vggt_create_point_cloud(
     model: VGGT,
     mask=None,
     device="cuda",
+    return_depth=False,
 ):
 
     image_names = [image_path]
@@ -324,6 +328,7 @@ def vggt_create_point_cloud(
     H, W = images_tensor.shape[2:]
 
     original_image_pil = Image.open(image_path).convert("RGB")
+    original_W, original_H = original_image_pil.size
     resized_image_pil = original_image_pil.resize((W, H), Image.Resampling.LANCZOS)
     resized_image_np = np.array(resized_image_pil)
     colors = resized_image_np / 255.0
@@ -333,17 +338,36 @@ def vggt_create_point_cloud(
 
     extrinsic, intrinsic = pose_encoding_to_extri_intri(predictions["pose_enc"], (H, W))
 
+    # save intrinsic to intrinsic.npy
+    np.save("intrinsic.npy", intrinsic.cpu().numpy())
     # Check if values are None before processing
     if extrinsic is None or intrinsic is None:
         print(
             "Error: Failed to extract camera parameters. extrinsic or intrinsic is None."
         )
         print(f"predictions[pose_enc] shape: {predictions['pose_enc'].shape}")
-        return
+        return None if not return_depth else (None, None)
 
     depth_map_np = predictions["depth"].cpu().numpy().squeeze(0).squeeze(0)
     extrinsic_np = extrinsic.cpu().numpy().squeeze(0).squeeze(0)
     intrinsic_np = intrinsic.cpu().numpy().squeeze(0).squeeze(0)
+
+    # Calculate focal length, point of view (POV), and dimensions
+    fx, fy = intrinsic_np[0, 0], intrinsic_np[1, 1]  # Focal lengths
+    cx, cy = intrinsic_np[0, 2], intrinsic_np[1, 2]  # Principal point
+
+    # Calculate width and height from principal point
+    width = cx * 2
+    height = cy * 2
+
+    # Calculate field of view (in degrees)
+    fov_x = 2 * np.arctan(width / (2 * fx)) * 180 / np.pi
+    fov_y = 2 * np.arctan(height / (2 * fy)) * 180 / np.pi
+
+    print(f"Focal length (fx, fy): ({fx:.2f}, {fy:.2f})")
+    print(f"Principal point (cx, cy): ({cx:.2f}, {cy:.2f})")
+    print(f"Image dimensions (width, height): ({width:.2f}, {height:.2f})")
+    print(f"Field of view (horizontal, vertical): ({fov_x:.2f}°, {fov_y:.2f}°)")
 
     depth_map_np_unsqueezed = np.expand_dims(depth_map_np, axis=0)  # (1, H, W, 1)
     extrinsic_np_unsqueezed = np.expand_dims(extrinsic_np, axis=0)  # (1, 4, 3)
@@ -373,4 +397,11 @@ def vggt_create_point_cloud(
     pcd.points = o3d.utility.Vector3dVector(points)
     pcd.colors = o3d.utility.Vector3dVector(colors)
 
+    if return_depth:
+        # Handle depth map resizing using OpenCV instead of PIL
+        # Ensure depth_map_np is properly shaped and normalized
+        resized_depth_np = cv2.resize(
+            depth_map_np, (original_W, original_H), interpolation=cv2.INTER_CUBIC
+        )
+        return pcd, resized_depth_np
     return pcd
